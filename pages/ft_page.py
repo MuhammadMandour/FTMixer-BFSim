@@ -5,6 +5,7 @@ All logic encapsulated in classes. Callbacks are thin and just orchestrate.
 ✅ All display logic in ImageViewer class
 ✅ All mixing logic in FTMixer class
 ✅ Callbacks just call class methods and update UI
+✅ FIXED: Component graphs now update properly when uploading new images
 """
 
 from dash import dcc, html, callback, Output, Input, State, ALL, MATCH, ctx
@@ -115,14 +116,40 @@ def create_image_viewer_ui(viewer_id: str, title: str, is_input: bool = True):
         components.append(
             dcc.Graph(
                 id={'type': 'graph-original', 'index': viewer_id},
-                config={'displayModeBar': False, 'scrollZoom': False},
+                config={
+                    'displayModeBar': False,
+                    'scrollZoom': False,
+                    'responsive': True
+                },
                 style={
-                    'height': '250px',
+                    'height': '260px',
                     'backgroundColor': COLORS['surface'],
-                    'borderRadius': '0.75rem'
+                    'borderRadius': '14px',
+                    'boxShadow': '0 6px 18px rgba(0,0,0,0.25)',
+                    'padding': '6px',
+                    'overflow': 'hidden'
+                },
+                figure={
+                    'layout': {
+                        'paper_bgcolor': COLORS['surface'],
+                        'plot_bgcolor': COLORS['surface'],
+                        'margin': dict(l=0, r=0, t=0, b=0),
+                        'xaxis': dict(
+                            visible=False,
+                            showgrid=False,
+                            zeroline=False
+                        ),
+                        'yaxis': dict(
+                            visible=False,
+                            showgrid=False,
+                            zeroline=False,
+                            scaleanchor='x'
+                        )
+                    }
                 }
             )
         )
+
     
     # Component selector and display (both input and output have this now!)
     components.extend([
@@ -583,19 +610,59 @@ def upload_and_display(contents, component_id):
 )
 def unify_sizes(all_contents):
     """Unify image sizes - THIN CALLBACK."""
-    loaded_viewers = [v for v in image_viewers.values() if v.has_image()]
+    # Get all input viewers that have images
+    loaded_viewers = [image_viewers[f'input_{i}'] for i in range(4) 
+                     if image_viewers[f'input_{i}'].has_image()]
+    
     if not loaded_viewers:
         raise PreventUpdate
     
+    # Find minimum dimensions
     shapes = [v.processor.shape for v in loaded_viewers]
+    print(f"📏 Unifying sizes: Current shapes = {shapes}")
+    
     min_h = min(s[0] for s in shapes)
     min_w = min(s[1] for s in shapes)
     target_shape = (min_h, min_w)
     
-    for viewer in loaded_viewers:
-        viewer.resize_to(target_shape)
+    print(f"📏 Target shape: {target_shape}")
     
-    return {'height': min_h, 'width': min_w}
+    # Resize all loaded images to target shape
+    for i, viewer in enumerate(loaded_viewers):
+        current_shape = viewer.processor.shape
+        if current_shape != target_shape:
+            print(f"   Resizing viewer {viewer.viewer_id}: {current_shape} -> {target_shape}")
+            viewer.resize_to(target_shape)
+            # ✅ ADDED: Explicitly clear FFT cache after resize
+            viewer.processor.fft_result = None
+            
+            # Verify resize worked
+            new_shape = viewer.processor.shape
+            if new_shape != target_shape:
+                print(f"   ⚠️ WARNING: Resize failed! Got {new_shape} instead of {target_shape}")
+            else:
+                print(f"   ✅ Resize successful: {new_shape}")
+        else:
+            print(f"   Viewer {viewer.viewer_id} already at target shape")
+    
+    # ✅ CRITICAL: Verify ALL viewers now have the same shape
+    final_shapes = [v.processor.shape for v in loaded_viewers]
+    all_same = all(s == target_shape for s in final_shapes)
+    
+    if not all_same:
+        print(f"❌ ERROR: Not all images have unified shape!")
+        print(f"   Final shapes: {final_shapes}")
+    else:
+        print(f"✅ All {len(loaded_viewers)} images unified to {target_shape}")
+    
+    # Return with timestamp to ensure uniqueness on each resize
+    import time
+    return {
+        'height': min_h, 
+        'width': min_w, 
+        'timestamp': time.time(),
+        'all_unified': all_same  # ✅ ADDED: Flag to check if unification succeeded
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BRIGHTNESS/CONTRAST CONTROL
@@ -706,25 +773,36 @@ def update_component(component_type, bc_state, rect, region_mode, component_id):
     return viewer.get_component_figure(rect, region_mode)
 
 
+# ✅ FIXED: This callback triggers component update when unified-size-store changes
+# This ensures that when images are resized, the FFT components are recalculated
+# We use ALL pattern to update all viewers when size unification happens
 @callback(
-    Output({'type': 'graph-component', 'index': MATCH}, 'figure', allow_duplicate=True),
-    [Input({'type': 'image-info', 'index': MATCH}, 'children')],
-    [State({'type': 'component-selector', 'index': MATCH}, 'value'),
-     State({'type': 'bc-state', 'index': MATCH}, 'data'),
+    Output({'type': 'graph-component', 'index': ALL}, 'figure', allow_duplicate=True),
+    [Input('unified-size-store', 'data')],
+    [State({'type': 'component-selector', 'index': ALL}, 'value'),
+     State({'type': 'bc-state', 'index': ALL}, 'data'),
      State('region-rect-store', 'data'),
-     State('region-mode', 'value'),
-     State({'type': 'component-selector', 'index': MATCH}, 'id')],
+     State('region-mode', 'value')],
     prevent_initial_call=True
 )
-def update_component_after_upload(image_info, component_type, bc_state, rect, region_mode, component_id):
-    """Trigger component update after image upload."""
-    if not image_info:  # No image loaded
+def update_all_components_after_resize(unified_size, all_components, all_bc_states, rect, region_mode):
+    """Trigger component update after image resize/unification."""
+    if unified_size is None:
         raise PreventUpdate
     
-    viewer_id = component_id['index']
-    viewer = image_viewers[viewer_id]
+    # Update all 6 viewers (4 inputs + 2 outputs)
+    all_viewer_ids = [f'input_{i}' for i in range(4)] + [f'output_{i}' for i in range(2)]
     
-    return viewer.get_component_figure(rect, region_mode)
+    figures = []
+    for viewer_id in all_viewer_ids:
+        viewer = image_viewers[viewer_id]
+        if viewer.has_image():
+            fig = viewer.get_component_figure(rect, region_mode)
+        else:
+            fig = viewer._create_empty_figure("Upload image first" if viewer.viewer_type == 'input' else "No result yet")
+        figures.append(fig)
+    
+    return figures
 
 # ─────────────────────────────────────────────────────────────────────────────
 # REGION CONTROL
@@ -767,39 +845,101 @@ def update_region(size_percent, current_rect):
      State('mixing-mode', 'value'),
      State('region-mode', 'value'),
      State('region-rect-store', 'data'),
-     State('output-selector', 'value')],
+     State('output-selector', 'value'),
+     State('unified-size-store', 'data')],  # ✅ ADDED: Ensure size unification is complete
     prevent_initial_call=True
 )
-def start_mixing(n_clicks, weights, mode, region_mode, rect, output_idx):
+def start_mixing(n_clicks, weights, mode, region_mode, rect, output_idx, unified_size):
     """Start mixing - THIN CALLBACK."""
     if not n_clicks:
         raise PreventUpdate
     
     global mixing_thread
     
-    # Cancel existing
+    # Cancel existing thread
     ft_mixer.cancel()
     if mixing_thread and mixing_thread.is_alive():
         mixing_thread.join(timeout=0.5)
     
+    # ✅ CRITICAL FIX: Reset cancel flag BEFORE starting new thread
+    # This prevents race condition where new thread sees old cancel flag
+    ft_mixer.reset_cancel()
+    
     # Check inputs
     input_processors = [image_viewers[f'input_{i}'].processor for i in range(4)]
-    if not any(p.image is not None for p in input_processors):
+    valid_processors = [p for p in input_processors if p.image is not None]
+    
+    if not valid_processors:
         return ("❌ No input images", 
                 {'width': '0%', 'height': '100%', 
                  'background': f'linear-gradient(90deg, {COLORS["error"]} 0%, {COLORS["error"]} 100%)'},
                 True)
     
+    # ✅ CRITICAL: Verify all images have the same shape
+    shapes = [p.shape for p in valid_processors]
+    print(f"🔍 Pre-mixing shape check: {shapes}")
+    
+    if len(set(shapes)) > 1:
+        print(f"❌ ERROR: Images have different shapes! Cannot mix.")
+        print(f"   Shapes: {shapes}")
+        print(f"   This means unify_sizes didn't work properly!")
+        
+        # Try to force unification again
+        min_h = min(s[0] for s in shapes)
+        min_w = min(s[1] for s in shapes)
+        target_shape = (min_h, min_w)
+        
+        print(f"   Attempting emergency resize to {target_shape}...")
+        for i, proc in enumerate(input_processors):
+            if proc.image is not None and proc.shape != target_shape:
+                viewer = image_viewers[f'input_{i}']
+                viewer.resize_to(target_shape)
+                proc.fft_result = None
+                print(f"   Emergency resized input_{i}: {proc.shape}")
+        
+        # Verify again
+        shapes = [p.shape for p in valid_processors]
+        if len(set(shapes)) > 1:
+            return ("❌ Cannot mix - size mismatch", 
+                    {'width': '0%', 'height': '100%', 
+                     'background': f'linear-gradient(90deg, {COLORS["error"]} 0%, {COLORS["error"]} 100%)'},
+                    True)
+    
+    print(f"✅ All images have matching shape: {shapes[0]}")
+    
     use_inner = (region_mode == 'inner')
+    
+    # ✅ ADDED: Verify all processors have cleared FFT cache after resize
+    # This ensures we compute FFT on the final resized images
+    for proc in input_processors:
+        if proc.image is not None:
+            proc.fft_result = None  # Force fresh FFT computation
     
     # Mix in background
     def mix_worker():
-        ft_mixer.reset_cancel()
+        # No need to reset_cancel here anymore - it's already done above
         result = ft_mixer.mix_components(input_processors, weights, mode, rect, use_inner)
         
         if result is not None and not ft_mixer.cancel_flag.is_set():
             output_viewer = image_viewers[f'output_{output_idx}']
-            output_viewer.load_from_array(result)
+            success = output_viewer.load_from_array(result)
+            
+            # ✅ ADDED: Verify the image was actually loaded
+            if success and output_viewer.has_image():
+                print(f"✅ Successfully loaded mixed result to output_{output_idx}")
+                print(f"   Result shape: {result.shape}, dtype: {result.dtype}")
+                print(f"   Viewer has image: {output_viewer.has_image()}")
+                print(f"   Image shape in viewer: {output_viewer.processor.shape}")
+            else:
+                print(f"❌ Failed to load mixed result to output_{output_idx}")
+                print(f"   Result is None: {result is None}")
+                print(f"   Success: {success}")
+                print(f"   Has image: {output_viewer.has_image()}")
+        else:
+            if result is None:
+                print("❌ Mixing returned None")
+            if ft_mixer.cancel_flag.is_set():
+                print("❌ Mixing was cancelled")
     
     mixing_thread = threading.Thread(target=mix_worker, daemon=True)
     mixing_thread.start()

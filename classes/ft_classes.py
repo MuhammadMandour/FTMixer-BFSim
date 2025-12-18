@@ -39,9 +39,24 @@ class ImageProcessor:
     
     def load_from_array(self, array: np.ndarray) -> np.ndarray:
         """Load image from numpy array."""
+        if array is None:
+            return None
+        
+        # Ensure array is 2D
+        if array.ndim != 2:
+            raise ValueError(f"Expected 2D array, got {array.ndim}D")
+        
+        # Convert to float64 and ensure proper range [0, 255]
         self.image = array.astype(np.float64)
+        
+        # Clip to valid range if needed
+        if self.image.min() < 0 or self.image.max() > 255:
+            print(f"⚠️ Image values out of range [{self.image.min()}, {self.image.max()}], clipping to [0, 255]")
+            self.image = np.clip(self.image, 0, 255)
+        
         self.shape = self.image.shape
-        self.fft_result = None
+        self.fft_result = None  # Reset FFT cache
+        
         return self.image
     
     def resize_to(self, target_shape: Tuple[int, int]) -> np.ndarray:
@@ -155,10 +170,28 @@ class ImageViewer:
     def load_from_array(self, array: np.ndarray) -> bool:
         """Load image from numpy array."""
         try:
-            self.processor.load_from_array(array)
+            if array is None:
+                print(f"❌ {self.viewer_id}: Received None array")
+                return False
+            
+            result = self.processor.load_from_array(array)
+            
+            if result is None:
+                print(f"❌ {self.viewer_id}: Processor returned None")
+                return False
+            
+            # Verify the image was actually stored
+            if not self.has_image():
+                print(f"❌ {self.viewer_id}: has_image() returned False after load")
+                return False
+            
+            print(f"✅ {self.viewer_id}: Successfully loaded array {array.shape}")
             return True
+            
         except Exception as e:
-            print(f"Error loading from array: {e}")
+            print(f"❌ {self.viewer_id}: Error loading from array: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def resize_to(self, target_shape: Tuple[int, int]) -> bool:
@@ -382,39 +415,60 @@ class FTMixer:
         Returns:
             Mixed image (inverse FFT result)
         """
+        print(f"🔧 Starting mix_components (mode={mode}, use_inner={use_inner})")
+        
         # Get valid processors and weights
         valid_data = [(p, w) for p, w in zip(processors, weights) 
                       if p is not None and p.image is not None]
         
+        print(f"   Valid processors: {len(valid_data)}/{len(processors)}")
+        
         if not valid_data:
+            print("❌ No valid data to mix")
             return None
         
         # Get reference shape
         ref_shape = valid_data[0][0].shape
+        print(f"   Reference shape: {ref_shape}")
         
         # Mix based on mode
         if mode == 'mag_phase':
+            print("   Using magnitude/phase mixing")
             mixed_fft = self._mix_magnitude_phase(valid_data, ref_shape)
         else:  # real_imag
+            print("   Using real/imaginary mixing")
             mixed_fft = self._mix_real_imaginary(valid_data, ref_shape)
+        
+        if mixed_fft is None:
+            print("❌ Mixing returned None (cancelled?)")
+            return None
+        
+        print(f"   Mixed FFT shape: {mixed_fft.shape}, dtype: {mixed_fft.dtype}")
         
         # Apply region selection if specified
         if rect is not None and len(valid_data) > 0:
+            print(f"   Applying region mask (inner={use_inner})")
             mask = self.create_region_mask(ref_shape, rect, use_inner)
             # Use first image as base for non-selected region
-            base_fft = valid_data[0][0].compute_fft()
-            mixed_fft = mask * mixed_fft + (1 - mask) * base_fft
-        
+            # base_fft = valid_data[0][0].compute_fft()
+            # mixed_fft = mask * mixed_fft + (1 - mask) * base_fft
+            mixed_fft = mask * mixed_fft
+
         # Check cancellation before expensive iFFT
         if self.cancel_flag.is_set():
+            print("❌ Cancelled before iFFT")
             return None
         
+        print("   Computing inverse FFT...")
         # Inverse FFT
         result = fft.ifft2(fft.ifftshift(mixed_fft))
         result = np.real(result)
         result = np.clip(result, 0, 255)
         
-        return result.astype(np.uint8)
+        result_uint8 = result.astype(np.uint8)
+        print(f"✅ Mix complete! Result shape: {result_uint8.shape}, range: [{result_uint8.min()}, {result_uint8.max()}]")
+        
+        return result_uint8
     
     def _mix_magnitude_phase(self, valid_data: list, shape: Tuple[int, int]) -> np.ndarray:
         """Mix using magnitude and phase components."""
